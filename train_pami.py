@@ -12,7 +12,7 @@ import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from modules.pami_try6 import Blipv2
+from modules.major_pami import Blipv2
 from modules.optimization import BertAdam
 
 from util import parallel_apply, get_logger
