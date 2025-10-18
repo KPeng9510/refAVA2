@@ -11,6 +11,10 @@ Overall, this work advances the frontier of language-guided human action underst
 ### Training
 Please use train_pami.py
 
+### Datasets
+
+The refAVA++ dataset is available here https://drive.google.com/drive/folders/13Rz83pdchOe5D6ZiadNm9ENZm3pPF7sx?usp=sharing. Please modify the corresponding paths in the dataset file.
+
 ## 📕 Installation
 
 - Python >= 3.8
