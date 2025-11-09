@@ -14,16 +14,27 @@ import numpy as np
 from modules.module_clip import CLIP, convert_weights
 from modules.modeling import CLIP4ClipPreTrainedModel, show_log, update_attr, check_attr
 from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
+import torch.nn as nn
+import torch.nn.functional as F
+from modules.inference_utils import load_model, load_image, predict, annotate
+import nltk
+from nltk.corpus import stopwords
 
-from src.utils import add_filehandler, save_pretrain, set_no_grad, wrap_model
-
-from transformers import AutoProcessor, Blip2Model
+import torch
+from transformers import AutoImageProcessor, AutoModel, pipeline
+import geoopt
+import torchvision
+BOX_TRESHOLD = 0.35
+TEXT_TRESHOLD = 0.25
+nltk.download('stopwords')
+stop_words = set(stopwords.words('english'))
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
 from torch import nn
 from functools import partial
 from einops.layers.torch import Rearrange, Reduce
-from transformers import AutoTokenizer
+from mamba_ssm import Mamba
+
 pair = lambda x: x if isinstance(x, tuple) else (x, x)
 from detr.models.backbone import Backbone, Joiner
 from detr.models.detr import DETR, PostProcess
@@ -32,31 +43,57 @@ from detr.models.segmentation import DETRsegm, PostProcessPanoptic
 from detr.models.transformer import Transformer
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
-from peft import LoraConfig, get_peft_model
+def iou_loss(pred, target, eps=1e-7):
+    """
+    pred, target: [N,4] in cxcywh format (normalized or absolute, but consistent)
+    Returns scalar IoU loss
+    """
+    pred = box_cxcywh_to_xyxy(pred)
+    target = box_cxcywh_to_xyxy(target)
+
+    # intersection
+    inter_x1 = torch.max(pred[:, 0], target[:, 0])
+    inter_y1 = torch.max(pred[:, 1], target[:, 1])
+    inter_x2 = torch.min(pred[:, 2], target[:, 2])
+    inter_y2 = torch.min(pred[:, 3], target[:, 3])
+    inter = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+
+    # union
+    area1 = box_area(pred)
+    area2 = box_area(target)
+    union = area1 + area2 - inter + eps
+
+    iou = inter / union
+    loss = 1.0 - iou
+    return loss.mean()
+
 import pickle as pkl
 f = open("/hkfs/work/workspace/scratch/fy2374-got/workspace/ijcai_folders/ravar/benchmarks/exp_new_model/try_2_2_sem/modules/worlds_feature.pkl", "rb")
 worlds_feature = pkl.load(f)
 f.close()
-'''
-config = LoraConfig(
-    r=8,
-    lora_alpha=32,
-    target_modules=["query"],
-    lora_dropout=0.05
-)
-'''
-slowfastlora_config = {
-    "type": "slowfastlora",
-    "r": 4,
-    "lora_alpha": 32,
-    "lora_dropout": 0.05,
-    "expert_num": 3,
-    "task_num": 1,
-    "task_embedding_dim": 64,
-}
-target_modules=["v_proj", "q_proj"]
-config = LoraConfig(r=4, lora_alpha=32, lora_dropout=0.05, bias="none", target_modules=["v_proj", "q_proj"])
+
+def box_cxcywh_to_xyxy(box):
+    # (cx,cy,w,h) -> (x1,y1,x2,y2)
+    cx, cy, w, h = box.unbind(-1)
+    x1 = cx - 0.5 * w
+    y1 = cy - 0.5 * h
+    x2 = cx + 0.5 * w
+    y2 = cy + 0.5 * h
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+def box_area(boxes):
+    return (boxes[:, 2] - boxes[:, 0]).clamp(min=0) * (boxes[:, 3] - boxes[:, 1]).clamp(min=0)
 torch.set_printoptions(precision=4, sci_mode=False, linewidth=150)
+bce = F.binary_cross_entropy_with_logits
+def auc_rank_loss(logits, y, margin=0.2):
+    pos = logits[y==1]; neg = logits[y==0]
+    if len(pos)==0 or len(neg)==0: 
+        return logits.new_tensor(0.)
+    # hard negatives
+    k = min(64, neg.numel())
+    hard_neg, _ = torch.topk(neg, k=k)
+    diff = pos.unsqueeze(1) - hard_neg.unsqueeze(0) - margin
+    return torch.log1p(torch.exp(-diff)).mean()
 
 def focal_binary_cross_entropy(logits, targets, gamma=2):
     l = logits.reshape(-1)
@@ -67,6 +104,37 @@ def focal_binary_cross_entropy(logits, targets, gamma=2):
     loss = logp*((1-p)**gamma)
     loss = loss.mean()
     return loss
+
+
+def focal_binary_cross_entropy_label_smooth(
+    logits, targets, gamma=2.0, alpha=None, label_smoothing=0.2
+):
+    # flatten
+    l = logits.reshape(-1).float()
+    t = targets.reshape(-1).float()
+    T = 0.98
+    # 1) label smoothing: 1 -> 1-ε, 0 -> ε
+    if label_smoothing > 0.0:
+        eps = label_smoothing
+        t = t * (1.0 - eps) + (1.0 - t) * eps
+
+    # 2) standard BCE (logits version for stability), no reduction yet
+    bce = F.binary_cross_entropy_with_logits(l/T, t, reduction="none")
+
+    # 3) focal modulating factor; p = sigmoid(l), p_t = p for positives else 1-p
+    p = torch.sigmoid(l)
+    p_t = torch.where(t >= 0.5, p, 1.0 - p)
+    focal_factor = (1.0 - p_t).pow(gamma)
+
+    loss = focal_factor * bce
+
+    # 4) optional class weighting alpha (weight positives by alpha, negatives by 1-alpha)
+    if alpha is not None:
+        alpha_t = torch.where(t >= 0.5, torch.as_tensor(alpha, device=l.device), 1.0 - torch.as_tensor(alpha, device=l.device))
+        loss = alpha_t * loss
+
+    return loss.mean()
+
 
 def _make_detr(backbone_name: str, dilation=False, num_classes=91, mask=False):
     hidden_dim = 256
@@ -94,6 +162,31 @@ def detr_resnet50(pretrained=False, num_classes=91, return_postprocessor=False):
     if return_postprocessor:
         return model, PostProcess()
     return model
+
+
+def pdist(a, b):
+    aa = (a*a).sum(-1, keepdim=True)
+    bb = (b*b).sum(-1, keepdim=True)
+    return aa + bb.transpose(-2,-1) - 2*a@b.transpose(-2,-1)
+
+def mmd_rbf(x, y, sigma=1.0):
+    X = x.reshape(-1, x.size(-1))     # [(B*T), D]
+    Y = y.reshape(-1, y.size(-1))
+    Kxx = torch.exp(-pdist(X,X)/(2*sigma**2)).mean()
+    Kyy = torch.exp(-pdist(Y,Y)/(2*sigma**2)).mean()
+    Kxy = torch.exp(-pdist(X,Y)/(2*sigma**2)).mean()
+    return Kxx + Kyy - 2*Kxy
+
+
+class SideAdapter(nn.Module):
+    def __init__(self, hidden_size, bottleneck=128):
+        super().__init__()
+        self.down = nn.Linear(hidden_size, bottleneck)
+        self.act = nn.ReLU()
+        self.up = nn.Linear(bottleneck, hidden_size)
+
+    def forward(self, x):
+        return x + self.up(self.act(self.down(x)))
 class AgentAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
                  agent_num=4, window=14, **kwargs):
@@ -283,42 +376,334 @@ def gather(keys):
     return keys 
     dist.gather(tensor, dst=root, group=group)
 
+def get_similar_indexes(text_embeddings, image_embeddings):
+    text_norm = F.normalize(text_embeddings, p=2, dim=2)           # [B, T, D]
+    image_norm = F.normalize(image_embeddings, p=2, dim=3)         # [B, Z, I, D]
+    B, Z, I, D = image_norm.shape
+    # Expand text to align with Z
+    text_expanded = text_norm.unsqueeze(2).expand(-1, -1, Z, -1)   # [B, T, Z, D]
+    image_expanded = image_norm.permute(0, 2, 1, 3)                # [B, I, Z, D]
+    image_expanded = image_expanded.permute(0, 2, 1, 3)            # [B, Z, I, D]
+
+    # Compute cosine similarity per time step: [B, T, Z, I]
+    #print(text_expanded.shape)
+    #print(image_expanded.shape)
+    cos_sim = torch.einsum("btzd,bzid->btzi", text_expanded, image_expanded)
+
+    # For each (B, T, Z), get the best matching image token (max over I)
+    max_sim_values, max_sim_indices = torch.max(cos_sim, dim=3)  # [B, T, Z], [B, T, Z]
+
+
+    """
+    for b in range(B):
+        print(f"\nBatch {b}:")
+        for t in range(T):
+            print(f"  Text token {t} → Image token {max_sim_indices[b, t].item()} (sim={max_sim_values[b, t].item():.4f})")
+    """
+
+    return max_sim_indices
+
+def get_matching_image_tokens(image_embeddings, max_sim_indices):
+    """
+    image_embeddings: [B, Z, I, D]
+    max_sim_indices: [B, T, Z] — best image token index at each [B, T, Z]
+    Returns:
+        selected_tokens: [B, T, Z, D] — most similar image token embeddings
+    """
+    B, Z, I, D = image_embeddings.shape
+    _, T, _ = max_sim_indices.shape
+
+    # Expand image_embeddings: [B, 1, Z, I, D] → for broadcasting
+    image_exp = image_embeddings.unsqueeze(1).expand(B, T, Z, I, D)  # [B, T, Z, I, D]
+
+    # Expand indices to match shape for gather
+    index_exp = max_sim_indices.unsqueeze(-1).unsqueeze(-1)         # [B, T, Z, 1, 1]
+    index_exp = index_exp.expand(-1, -1, -1, 1, D)                   # [B, T, Z, 1, D]
+
+    # Gather along dim=3 (I dimension)
+    selected_tokens = torch.gather(image_exp, dim=3, index=index_exp)  # [B, T, Z, 1, D]
+
+    # Remove the singleton dimension
+    selected_tokens = selected_tokens.squeeze(3)  # [B, T, Z, D]
+
+    return selected_tokens
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, dropout=0.1, num_queries: int = 6):
+        """
+        num_queries: if > 0, create learnable queries of shape [num_queries, D]
+        """
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim)*4),
+            nn.GELU(),
+            nn.Linear(int(embed_dim)*4, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+        self.num_queries = num_queries
+        if num_queries > 0:
+            # Learned query tokens (broadcasted across the batch)
+            self.query_tokens = nn.Parameter(torch.randn(num_queries, embed_dim) * 0.02)
+    @torch.no_grad()
+    def _make_learned_queries(self, B, device, dtype):
+        # [1, NQ, D] -> [B, NQ, D]
+        return self.query_tokens.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+
+    def forward(self, context, query=None, append_learned: bool = False, return_split: bool = False):
+        """
+        context: [B, T_kv, D]  (e.g., features_image)
+        query:   [B, T_q,  D]  (optional external queries)
+        
+        Modes:
+          - If query is None and num_queries>0: use learned queries only -> returns [B, NQ, D]
+          - If query is provided and append_learned=False: standard cross-attn on 'query'
+          - If query is provided and append_learned=True and num_queries>0:
+                concatenate [query, learned_queries] as the attention queries,
+                and (optionally) return the split (external vs learned) if return_split=True.
+        """
+        B, _, D = context.shape
+        device, dtype = context.device, context.dtype
+
+        learned_q = None
+        if self.num_queries > 0:
+            learned_q = self._make_learned_queries(B, device, dtype)
+
+        if query is None:
+            assert learned_q is not None, "No query provided and num_queries=0; nothing to attend with."
+            q = learned_q
+            split_sizes = None
+        elif append_learned and learned_q is not None:
+            q = torch.cat([query, learned_q], dim=1)      # [B, T_q + NQ, D]
+            split_sizes = (query.size(1), learned_q.size(1))
+        else:
+            q = query
+            split_sizes = None
+
+        # Cross-attention: queries attend to the context (keys/values)
+        attn_output, _ = self.attn(query=q, key=context, value=context)
+
+        # Add & norm
+        x = self.norm1(q + attn_output)
+
+        # Feedforward with residual
+        x = self.norm2(x + self.ff(x))
+
+        if return_split and split_sizes is not None:
+            x_query, x_learned = torch.split(x, split_sizes, dim=1)
+            return x_query, x_learned   # external-query outputs, learned-query outputs
+        return x
+
+class CrossAttentionBlock2(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, query, context):
+        """
+        query:   [B, T_q, D]  (agg_trajs)
+        context: [B, T_kv, D] (features_image)
+        returns: [B, T_q, D]
+        """
+        # Apply multi-head attention
+        attn_output, _ = self.attn(query=query, key=context, value=context)
+
+        # Add & norm
+        x = self.norm1(query + attn_output)
+
+        # Feedforward with residual
+        x = x + self.ff(x)
+        x = self.norm2(x)
+        return x
+def irm_penalty(logits, y):
+    # logits from a scalar "dummy" classifier w*phi(x); assume cross-entropy
+    import torch
+    scale = torch.ones(1, requires_grad=True, device=logits.device)
+    loss = focal_binary_cross_entropy(logits*scale, y)
+    grad = torch.autograd.grad(loss, [scale], create_graph=True)[0]
+    return (grad**2).sum()
+
+class ClassCentersEMA(torch.nn.Module):
+    def __init__(self, num_classes: int, feat_dim: int, momentum: float = 0.9, normalize: bool = True, device=None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.momentum = momentum
+        self.normalize = normalize
+
+        centers = torch.zeros(num_classes, feat_dim, dtype=torch.float32, device=device)
+        self.register_buffer("centers", centers)          # [C, D]
+        self.register_buffer("initialized", torch.zeros(num_classes, dtype=torch.bool, device=device))
+
+    @torch.no_grad()
+    def update(self, feats: torch.Tensor, targets: torch.Tensor):
+        """
+        feats:   [B, D] features from the backbone/head (optionally L2-normalized)
+        targets: [B, C] multi-hot (0/1) labels
+        """
+        assert feats.dim() == 2 and targets.dim() == 2
+        B, D = feats.shape
+        C = targets.shape[1]
+        assert C == self.num_classes and D == self.feat_dim
+
+        if self.normalize:
+            feats = F.normalize(feats, dim=1)
+
+        # counts per class: [C]
+        counts = targets.sum(dim=0)                       # how many positives per class in this batch
+
+        # class sums via matrix multiply: [C, D]
+        # (targets^T) @ feats computes sum of features for each class across positives
+        class_sums = targets.t().matmul(feats)            # [C, D]
+
+        # indices of classes that appear in the batch
+        mask = counts > 0
+        if mask.any():
+            # compute means only for present classes
+            means = torch.zeros_like(self.centers)
+            means[mask] = class_sums[mask] / counts[mask].unsqueeze(1)
+
+            # initialize unseen classes on their first appearance to the mean
+            new_classes = (~self.initialized) & mask
+            self.centers[new_classes] = means[new_classes]
+            self.initialized[new_classes] = True
+
+            # EMA update for seen classes
+            m = self.momentum
+            self.centers[mask] = m * self.centers[mask] + (1 - m) * means[mask]
+
+            if self.normalize:
+                self.centers[mask] = F.normalize(self.centers[mask], dim=1)
+
+        # classes with no positives: skip update
+        return self.centers
+def flatten_ntd(x):
+    """
+    x: [N,T,D] -> [N*T, D]
+    """
+    return x.reshape(-1, x.size(-1))
+
+def loss_maximize_mmd_seq(x, y):
+    """
+    x: [N,T,D], y: [M,T,D] or [M,T',D]
+    Compare as distributions (ignoring temporal alignment).
+    """
+    x_flat = flatten_ntd(x)
+    y_flat = flatten_ntd(y)
+    return loss_maximize_mmd(x_flat, y_flat)   # from my earlier message
+
 class Blipv2(nn.Module):
     def __init__(self,):
         super(Blipv2, self).__init__()
-        #self.model, self.vis_processors, _ = load_model_and_preprocess(name="blip2_feature_extractor", model_type="pretrain", is_eval=True)
-        self.model = Blip2Model.from_pretrained("Salesforce/blip2-opt-2.7b")
-
-        #print(self.model)
-        self.model = get_peft_model(self.model, config)
-        
-        self.proj = nn.Linear(772,768)
-        self.agent_temporal = AgentBlock(dim=768, num_heads=1, window=8) #AgentAttention()
-        self.processor = AutoProcessor.from_pretrained("Salesforce/blip2-opt-2.7b")
-        #self.img_proj = nn.Linear(1408, 768)
-        self.text_proj = nn.Linear(50304, 768)
-        self.bbox_regressio_head = nn.Sequential(nn.Linear(768, 512), nn.ReLU(), nn.Linear(512,128), nn.ReLU(), nn.Linear(128,4))
-        self.classification_head = nn.Sequential(nn.Linear(768, 512), nn.Dropout(0.2), nn.ReLU(), nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 80))
-        self.tokenizer = AutoTokenizer.from_pretrained("Salesforce/blip2-opt-2.7b")
-        self.detection_model =  detr_resnet50(pretrained=True).eval()#torch.hub.load('facebookresearch/detr', 'detr_resnet50', pretrained=True, force_reload=True)
-        for param in self.detection_model.parameters():
+        self.modelblip, self.vis_processors, _ = load_model_and_preprocess(name="blip2_feature_extractor", model_type="pretrain", is_eval=False)
+        '''for block in self.modelblip.visual_encoder.blocks:
+            block.side_adapter = SideAdapter(block.mlp.fc1.in_features)
+            old_forward = block.forward
+            def new_forward(self, x, *args, **kwargs):
+                x = old_forward(x, *args, **kwargs)
+                return self.side_adapter(x)
+            block.forward = new_forward.__get__(block, block.__class__)'''
+        for name, param in self.modelblip.named_parameters():
+            #if "side_adapter" not in name:
             param.requires_grad = False
         self.proj_box = nn.Linear(100,32)
         self.proj_sem = nn.Linear(1, 32)
-        self.proj_img = nn.Linear(8,32)
-        self.agent_box = AgentBlock(dim=768, num_heads=1, window=8)
-        #self.weights = torch.Tensor(np.load("/hkfs/work/workspace/scratch/fy2374-ijcai/ravar/benchmarks/exp_new_model/try_4/dataloaders/label_num.npy"))
+        self.proj = nn.Linear(772,768)
+        #self.agent_temporal = AgentBlock(dim=768, num_heads=1, window=8) #AgentAttention()
+        #self.grounding_dino = load_model("/hkfs/work/workspace/scratch/fy2374-got/workspace/ijcai_folders/ravar/benchmarks/exp_new_model/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py", "/hkfs/work/workspace/scratch/fy2374-got/workspace/ijcai_folders/ravar/benchmarks/exp_new_model/GroundingDINO/weights/groundingdino_swint_ogc.pth")
+        '''self.dinov3 =  pipeline(
+                model="facebook/dinov3-convnext-tiny-pretrain-lvd1689m",
+                task="image-feature-extraction", 
+            )'''
+        self.llm_model, self.vis_processors, self.txt_processors = load_model_and_preprocess(
+            name="blip2_opt", model_type="pretrain_opt2.7b", is_eval=True,
+        )
+        self.proj_text = nn.Linear(2560,768)
+        self.detection_model =  detr_resnet50(pretrained=True).eval()#torch.hub.load('facebookresearch/detr', 'detr_resnet50', pretrained=True, force_reload=True)
+        for param in self.detection_model.parameters():
+            param.requires_grad = False
+        #self.bbox_regression_head = nn.Sequential(nn.Linear(768, 4))
+        
+        
+        self.bbox_regression_head = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128,4), nn.Sigmoid())
+        self.classification_head = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 80))
+
+        self.bbox_regression_head2 = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128,4), nn.Sigmoid())
+        self.classification_head2 = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 80))
+
+        self.mamba_fusion_temp = nn.Sequential(nn.Linear(768, 256), Mamba(d_model=256)) #Mamba(d_model=768)
+        self.mamba_fusion = nn.Sequential(Mamba(d_model=768)) #Mamba(d_model=768)
+        self.mamba_bbox = nn.Sequential(nn.Linear(768, 256), Mamba(d_model=256))
+        self.mamba_image = nn.Sequential(nn.Linear(768, 256), Mamba(d_model=256))
+        self.manifold = geoopt.manifolds.PoincareBall(c=1)
+
         self.bceloss = torch.nn.BCEWithLogitsLoss()
         self.mseloss = torch.nn.MSELoss()
-        self.agent_semantic = AgentBlock(dim=768, num_heads=1, window=8)
+        self.cross_attention = CrossAttentionBlock(embed_dim=256, num_heads=8)
+        self.cross_attention_2 = CrossAttentionBlock(embed_dim=256, num_heads=8)
+        self.cross_attention_box = CrossAttentionBlock(embed_dim=256, num_heads=8)
+
+        self.cross_attention_sem = CrossAttentionBlock(embed_dim=256, num_heads=8)
+        self.cross_attention_sem2 = CrossAttentionBlock(embed_dim=256, num_heads=8)
+        self.cross_attention_box2 = CrossAttentionBlock(embed_dim=256, num_heads=8)
+        self.proj_img = nn.Linear(768, 256)
+        self.proj_boxes = nn.Linear(768, 256)
+        self.proj_text2 = nn.Linear(768, 256)
+
+        self.latent_proj = nn.Linear(256, 256)
+        self.latent_proj2 = nn.Linear(256, 256)
+
+    def center_pull_loss(self, feats, targets, reduce='mean'):
+        """
+        feats:   [B, D] embeddings
+        targets: [B, C] multi-hot {0,1}
+        centers: [C, D] prototypes (buffer, no grad)
+        """
+        centers = self.centers.centers
+
+        feats = F.normalize(feats, dim=1)
+        centers_n = F.normalize(centers.detach(), dim=1)
+
+        # cosine similarity: [B, C]
+        sim = feats @ centers_n.T
+
+        # (1 - cos) for positives
+        pos_mask = targets.bool()
+        pos_terms = (1.0 - sim) * targets  # [B, C], zero if not positive
+
+        # per-sample average across positive classes
+        counts = targets.sum(dim=1).clamp_min(1)  # [B]
+        per_sample = pos_terms.sum(dim=1) / counts
+
+        if reduce == 'mean':
+            # only average over samples that had ≥1 positive label
+            mask = targets.sum(dim=1) > 0
+            return per_sample[mask].mean() if mask.any() else feats.new_tensor(0.)
+        else:
+            return per_sample
 
     def forward(self, key_frame, input_ids, token_type_ids, attention_mask, video, video_mask=None, bbox=None, ann=None, training=True):
-        #print('test')
-        #i#nput_ids = input_ids.view(-1, input_ids.shape[-1])
-        # T x 3 x H x W
-        #print(key_frame.shape)
         worlds = worlds_feature.cuda()
-        #print(key_frame.squeeze().shape)
+        text_emb_list = []
+        video = torch.as_tensor(video).float()
+        if len(video.shape) == 5:
+            video = video.unsqueeze(1).unsqueeze(1)
+        else:
+            video = video.unsqueeze(1)
+        
+        b, pair, bs, ts, channel, h, w = video.shape
+
+
         detect_results = self.detection_model(key_frame.squeeze())
 
         preds = detect_results["pred_logits"] # B,Q,N
@@ -329,111 +714,135 @@ class Blipv2(nn.Module):
 
         w_embs = torch.index_select(worlds, 0, categories)
         w_embs = w_embs.contiguous().view(B, 100, -1)
-        #boxes_person = []
-        '''for pred, box in zip(preds, boxes):
-            mask = torch.argmax(torch.nn.functional.softmax(pred,-1),-1) == 1
-            if True in mask:
-                box_person = box[mask,:].contiguous().view(-1, 4) # B,Q,N
-                boxes_person.append(box_person)
-            else:
-                boxes_person.append(torch.zeros(1, 4).cuda())
-        #print(boxes_person.shape)
-        #boxes_person = torch.cat(boxes_person)
-        cls_scores = torch.max(preds[mask], -1)[0]
-        batch,q,channels = boxes.shape
-        box_container = torch.zeros(batch, 20, channels).cuda()
-        if boxes_person.shape[1] <= 20:
-            box_container[:,:boxes_person.shape[1],:] = boxes_person
-        else:
-            indexs = torch.topk(cls_scores,20,1)[1]
-            resort_boxes = torch.index_select(boxes_person, 1, indexs)
-            box_container = resort_boxes
-        boxes = box_container'''
-        # boxes = boxes.unsqueeze(1).repeat(1, 100, 1, 1)
-        video = torch.as_tensor(video).float()
-        video = video.unsqueeze(1).unsqueeze(1)
-    
-        b, pair, bs, ts, channel, h, w = video.shape
-        #print(video.shape)
-        '''agg_token_tem = self.aggregation_token_temporal.unsqueeze(1).repeat(b,1,1)
-        agg_token_spa = self.aggregation_token_spatio.unsqueeze(1).repeat(b,1,1)
-        agg_token_sem = self.aggregation_token_semantic.unsqueeze(1).repeat(b,1,1)
-        agg_token_box = self.aggregation_token_boxes.unsqueeze(1).repeat(b,1,1)'''
-        #print(video.shape)
-        #print(boxes.shape)
         boxes = torch.stack([boxes[...,0] - 0.5*boxes[...,3], boxes[...,1] - 0.5*boxes[...,2], boxes[...,0] + 0.5*boxes[...,3],boxes[...,1] + 0.5*boxes[...,2]],-1)
 
         bboxes = self.proj(torch.cat([boxes, w_embs], -1))
         mask = torch.argmax(preds,-1) != 1
         bboxes[mask] = 0.0* bboxes[mask]
-        #bboxes = self.proj_box(bboxes.contiguous().permute(0,2,1)).permute(0,2,1)
-        '''bboxes = bboxes.unsqueeze(1).repeat(1, 8,1,1).flatten(1,2)
-        boxes = torch.cat([bboxes, agg_token_box], dim=1)'''
-        
-        #f_boxes, attn_box = self.agent_box(boxes)
-        #f_boxes = f_boxes.mean(1).unsqueeze(1) 
+        boxes = self.proj_box(bboxes.contiguous().permute(0,2,1)).contiguous().permute(0,2,1)
+
+        #print(boxes.shape)
+
         video = video.contiguous().view(b * pair * bs* ts, channel, h, w)
         video_frame = bs * ts
+        #with torch.no_grad():
+        #print(b)
         #print(input_ids)
-        text = []
-        for i in range(b):
-            for j in range(ts):
-                text.append(input_ids[i])
-        inputs_text = self.tokenizer(text,padding=True, return_tensors="pt")
-        #print(inputs_text)
-        #import os
-        #os.exit()
-        #sample = {"image": video.half().cuda(), "text_input": text}
-        features_image = self.model.get_qformer_features(video.half().cuda(), return_dict=True)#self.model.extract_features(sample, mode="image") # batch_size, 8, 32, 768
-        #print(features_image['pooler_output'].shape)
-        #import os
-        #os.exit()
-        features_image = features_image['last_hidden_state']
-        #print(features_image.shape)
-        #import os
-        #os.exit()
-        #print(inputs_text.keys())
-        features_text = self.model.get_text_features(inputs_text["input_ids"].cuda())#self.model.extract_features(sample, mode="text") # batch_size, 12, 768
-        features_text = self.text_proj(features_text['logits'])
-        #print(features_text.shape)
-        #print(features_text['logits'].shape)
-        
-        #features_text = features_text.text_embeds.contiguous().view(b, ts, -1, 768).mean(1).mean(1).unsqueeze(1)
+        with torch.no_grad():
+            text = []
+            for i in range(b):
+                for j in range(ts):
+                    #print(i)
+                    text.append("Predict the fine-grained action of " + input_ids[i])
+            sample = {"image": video.half().cuda(), "text_input": text}
+            features_text = self.modelblip.extract_features(sample, mode="text") # batch_size, 12, 768
 
-        #print(features_image.shape)
-        boxes = self.proj_box(bboxes.contiguous().permute(0,2,1)).contiguous().permute(0,2,1)
+            features_text = features_text.text_embeds.contiguous().view(b, ts, -1, 768).mean(2)
+            features_image = self.modelblip.extract_features(sample, mode="image") # batch_size, 8, 32, 768
+
+        features_image = features_image.image_embeds.contiguous().view(b, ts, -1, 768)
+        sem_trajs = []
+
+        for sind, sentence in enumerate(input_ids):
+            # 1. Remove stopwords
+            
+            image_tokens = features_image[sind].unsqueeze(0)
+
+            words = sentence.strip().split()
+            filtered_words = [word for word in words if word.lower() not in stop_words]
+            filtered_sentence = ' '.join(filtered_words)
+            tokenized = self.llm_model.tokenizer(
+                filtered_sentence,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=30,
+                return_attention_mask=True,
+                return_token_type_ids=False,
+            )
+            tokenized = {k: v.cuda() for k, v in tokenized.items()}
+            with torch.no_grad():
+                #with torch.no_grad():
+                output = self.llm_model.opt_model(**tokenized, output_hidden_states=True, return_dict=True)
+            last_hidden = output.hidden_states[-1]  # shape: (1, seq_len, hidden_dim)
+            # 4. Decode tokens
+            tokens = self.llm_model.tokenizer.convert_ids_to_tokens(tokenized["input_ids"][0])
+            # 5. Filter out padding/special tokens
+            valid_mask = tokenized["attention_mask"][0].bool()
+            valid_tokens = [tok for i, tok in enumerate(tokens) if valid_mask[i]]
+            valid_embeddings = last_hidden[0][valid_mask]
+            #print(valid_embeddings.shape)
+            # 6. Store results
+            #results.append(self.proj_text(valid_embeddings))
+            desire_text_tokens = self.proj_text(valid_embeddings.unsqueeze(0)) # 1,T,D
+
+            indexes = get_similar_indexes(desire_text_tokens,image_tokens)
+            image_trajectories = get_matching_image_tokens(image_tokens, indexes)
+            #print(image_trajectories.shape)
+            B,S,T,D = image_trajectories.shape
+            sem_trajs.append(self.mamba_fusion(image_trajectories.view(B, -1, D)).contiguous().view(B,S,T,D).mean(1))
+
+        sem_trajs = torch.cat(sem_trajs,0)
+        agg_trajs = self.mamba_fusion_temp(sem_trajs) # B,T,D
+        features_image_proj = self.mamba_image(features_image.view(b, -1, D)).contiguous().view(b,-1,T, 256)
+        #print(features_image_bboxes.shape)
+
+        indexes_bboxes = get_similar_indexes(bboxes, features_image)
+        bboxes_trajectories = get_matching_image_tokens(features_image, indexes_bboxes).view(b,-1,D)
+        #print(bboxes_trajectories.shape)
+        bboxes = self.mamba_bbox(bboxes_trajectories).contiguous().view(b,-1,T,256).mean(1)
         #print(boxes.shape)
-        #print(boxes.shape)
-        boxes, attn_box, a_t_b= self.agent_box(boxes)
-        features_text = self.proj_sem(features_text.mean(1).unsqueeze(-1)).contiguous().permute(0,2,1)
-        #print(features_text.shape)
-        features_text = features_text.contiguous().view(b, ts,-1, 768).mean(1)
-        features_text,attn_sem, a_t_s = self.agent_semantic(features_text)
-        #print(attn_sem.shape)
-        #print(attn_box.shape)
-        
-        #logits = f_spatio.mean(1) + f_temporal.mean(1) + f_semantic.mean(1)#features_image.image_embeds.mean(1).contiguous().view(b, ts, -1).mean(1) + features_text.text_embeds.mean(1).contiguous().view(b, ts, -1).mean(1)
-        features_image = features_image.contiguous().view(b, ts,-1, 768)
-        #print(features_image.mean(1).shape)
-        #features_image = self.proj_img(features_image.permute(0,2,1)).permute(0,2,1)
-        features_image,_, _ = self.agent_temporal(features_image.mean(1), attn_sem, attn_box, a_t_s, a_t_b)
-        logits = bboxes.mean(1) + features_text.mean(1) + features_image.mean(1)
-        bbox_prediction = self.bbox_regressio_head(logits)
-        predictions = self.classification_head(logits)
+        #bboxes = self.proj_boxes(boxes)
+
+        #features_image = features_image.mean(2) # B,T,D
+        #features_image = self.mamba_image(features_image)
+        features_text = self.proj_text2(features_text)
+        #print(features_image_proj.mean(2).shape)
+        #print(bboxes.shape)
+        output = self.cross_attention_box(bboxes, features_image_proj.mean(2)).mean(1) +  self.cross_attention(agg_trajs, features_image_proj.mean(2)).mean(1) + self.cross_attention_sem(features_text, features_image_proj.mean(2)).mean(1) #+ self.proj_feature_text(features_text) # [B, T, D]
+        output_2 = self.cross_attention_box2(bboxes, features_image_proj.mean(1)).mean(1) + self.cross_attention_2(agg_trajs, features_image_proj.mean(1)).mean(1) + self.cross_attention_sem2(features_text, features_image_proj.mean(1)).mean(1) #+ self.proj_feature_text_2(features_text)
+
+        #output = self.manifold.expmap0(output)
+        #output_2 = self.manifold.expmap0(output_2)
+
+        '''with torch.no_grad():
+            self.centers.update(output.detach(), ann.float().cuda())'''
+
+
+        residual_boxes = self.bbox_regression_head(output)#pred_boxes.cuda()
+        cls_results = self.classification_head(output)
+
+        residual_boxes2 = self.bbox_regression_head2(output_2)
+        cls_results2 = self.classification_head2(output_2)
+
+        #mmd_loss = 1-mmd_rbf(output_2_2, output_1_2)
+
+
+
         #print(predictions[0])
         #print(ann[0])
         if training:
             #predictions = gather(predictions)
             #ann = gather(ann)
-            loss_cls = self.bceloss(predictions, ann.float().cuda())
-            loss_cls = loss_cls
-            batch_size = bbox_prediction.shape[0]
-            loss_bbox = self.mseloss(bbox_prediction.reshape(batch_size, 4), bbox.float().cuda())
+            #print(cls_results.shape)
+            #print(ann.shape)
+            #ann = ann[:,0]
+            loss_cls = focal_binary_cross_entropy_label_smooth(cls_results, ann.float().cuda()) + auc_rank_loss(cls_results, ann.float().cuda()) + irm_penalty(cls_results, ann.float().cuda()) #- 0.1*F.binary_cross_entropy_with_logits(cls_results, 1-ann.float().cuda())
+            loss_bbox = self.mseloss(residual_boxes, bbox.float().cuda()) + iou_loss(residual_boxes, bbox.float().cuda())
+
+            loss_cls2 = focal_binary_cross_entropy_label_smooth(cls_results2, ann.float().cuda()) + auc_rank_loss(cls_results2, ann.float().cuda()) + irm_penalty(cls_results2, ann.float().cuda()) #- 0.1*F.binary_cross_entropy_with_logits(cls_results2, 1-ann.float().cuda()) 
+            loss_bbox2 = self.mseloss(residual_boxes2, bbox.float().cuda()) + iou_loss(residual_boxes2, bbox.float().cuda())
             
-            loss = 1*torch.mean(loss_bbox) + 5*torch.mean(loss_cls)
+
+
+            loss = 2*torch.mean(loss_bbox) + torch.mean(loss_cls) + 2*torch.mean(loss_bbox2) + torch.mean(loss_cls2) #+ mmd_loss  #+ self.center_pull_loss(output, ann.float().cuda())
+            #print('bbox_loss:', torch.mean(loss_bbox))
+            #print('cls_loss:', torch.mean(loss_cls))
         else:
             loss = 0.0
-        return loss, predictions, bbox_prediction, ann
+
+
+        return loss, (cls_results + cls_results2)/2, (residual_boxes + residual_boxes2)/2, ann, output
 
 class AsymmetricLoss(nn.Module):
     def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=True):
