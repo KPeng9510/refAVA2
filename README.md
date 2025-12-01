@@ -21,9 +21,18 @@ The refAVA++ dataset is available here https://drive.google.com/drive/folders/13
 - PyTorch >= 1.9.0
 - PyYAML, tqdm, tensorboardX
 
+##  Trained model
+
+Some readers reached out for the model weight, due to the limited storage space of the online storage tools, the authors are facing with issues to upload it successfully. We will update the link once the uploading issue is solved. thanks.
+
 
 ## 🤝 Cite:
 Please consider citing this paper if you use the ```code``` or ```data``` from our work.
 Thanks a lot :)
 
-bibtex will be provided soon.
+@article{peng2025refatomnet++,
+  title={RefAtomNet++: Advancing Referring Atomic Video Action Recognition using Semantic Retrieval based Multi-Trajectory Mamba},
+  author={Peng, Kunyu and Wen, Di and Fu, Jia and Wu, Jiamin and Yang, Kailun and Zheng, Junwei and Liu, Ruiping and Chen, Yufan and Fu, Yuqian and Paudel, Danda Pani and others},
+  journal={arXiv preprint arXiv:2510.16444},
+  year={2025}
+}
